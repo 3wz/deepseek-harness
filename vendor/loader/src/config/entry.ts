@@ -57,6 +57,8 @@ export class Entry {
   public parent!: EntryGroup
   // safety: call `entry.update()` immediately after creating an entry
   public options = {} as EntryOptions
+  /** Last failure recorded under `tolerateFailures`, when the entry stays inert. */
+  public error?: unknown
   public subgroup?: EntryGroup
   public subtree?: EntryTree
 
@@ -140,6 +142,18 @@ export class Entry {
 
   /** Merge new options, restart as needed, and persist through the parent tree. */
   async update(options: Partial<EntryOptions>, create = false, force = false) {
+    try {
+      await this._update(options, create, force)
+    } catch (error) {
+      if (this.parent.tree.tolerateFailures) {
+        this.tolerate(error)
+      } else {
+        throw error
+      }
+    }
+  }
+
+  private async _update(options: Partial<EntryOptions>, create = false, force = false) {
     const previousOptions = this.options
     const legacy = { ...previousOptions }
     const candidate = create ? options as EntryOptions : { ...previousOptions }
@@ -259,6 +273,12 @@ export class Entry {
   async init() {
     try {
       await (this._initTask ??= this._init())
+    } catch (error) {
+      if (this.parent.tree.tolerateFailures) {
+        this.tolerate(error)
+      } else {
+        throw error
+      }
     } finally {
       this._initTask = undefined
       if (!this.loader.getTasks().length) this.ctx.reflect.notify(['loader'])
@@ -270,8 +290,22 @@ export class Entry {
     try {
       await this.fiber?.await()
     } catch (error) {
-      throw updateError('apply', this.options, error)
+      if (this.parent.tree.tolerateFailures) {
+        this.tolerate(error)
+      } else {
+        throw updateError('apply', this.options, error)
+      }
     }
+  }
+
+  /** Log one entry failure and keep the entry inert under `tolerateFailures`. */
+  private tolerate(error: unknown) {
+    this.error = error
+    this.fiber = undefined
+    const detail = error instanceof Error ? error.message : String(error)
+    this.context.root.logger?.('loader').warn(
+      'failed to load entry %C (%C): %C', this.options.id, this.options.name, detail,
+    )
   }
 
   private async _init() {

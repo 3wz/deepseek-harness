@@ -1,5 +1,7 @@
 import { composeError, Context } from '@deepseek-ai/cordis'
 import { isNonNullable, type Dict } from '@deepseek-ai/cosmokit'
+import { isAbsolute } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { Entry, type EntryOptions } from './entry.ts'
 import { EntryGroup } from './group.ts'
 
@@ -9,6 +11,12 @@ export abstract class EntryTree {
 
   public ctx: Context
   public enableLogs?: boolean
+  /**
+   * When true, a failing child entry is logged and kept inert instead of
+   * failing this tree: its import/apply error is recorded on the entry
+   * (`entry.error`) and the remaining entries keep mounting.
+   */
+  public tolerateFailures?: boolean
   public root: EntryGroup
   public store: Dict<Entry> = Object.create(null)
 
@@ -50,14 +58,27 @@ export abstract class EntryTree {
         await Promise.allSettled(tasks)
         continue
       }
-      const outcomes = await Promise.allSettled(
-        [...this.entries()].map(entry => entry._await()),
-      )
+      const entries = [...this.entries()]
+      const outcomes = await Promise.allSettled(entries.map(entry => entry._await()))
       const failures = outcomes
         .filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected')
         .map(outcome => outcome.reason)
-      if (failures.length === 1) throw failures[0]
-      if (failures.length > 1) throw new AggregateError(failures, 'loader fibers failed')
+      if (failures.length) {
+        if (this.tolerateFailures) {
+          outcomes.forEach((outcome, index) => {
+            if (outcome.status !== 'rejected') return
+            const entry = entries[index]
+            const detail = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)
+            this.ctx.root.logger?.('loader').warn(
+              'loader entry %C (%C) failed to settle: %C',
+              entry?.options.id, entry?.options.name, detail,
+            )
+          })
+        } else {
+          if (failures.length === 1) throw failures[0]
+          if (failures.length > 1) throw new AggregateError(failures, 'loader fibers failed')
+        }
+      }
       this.ctx.reflect.notify(['loader'])
       if (!this.getTasks().length) return
     }
@@ -151,12 +172,15 @@ export abstract class EntryTree {
       // onImport.tracePromise.__proto__
       // internal.import
       info.offset += 3
+      // Node's ESM loader rejects bare Windows/POSIX absolute paths ('c:/...',
+      // '/abs/...'); normalize them to file: URLs so entry names may be paths.
+      const specifier = isAbsolute(name) ? pathToFileURL(name).href : name
       if (this.ctx.loader.internal) {
-        return await this.ctx.loader.internal.import(name, this.ctx.baseUrl!, {})
+        return await this.ctx.loader.internal.import(specifier, this.ctx.baseUrl!, {})
       } else if (name.startsWith('.')) {
         return await import(/* @vite-ignore */new URL(name, this.ctx.baseUrl).href)
       } else {
-        return await import(/* @vite-ignore */name)
+        return await import(/* @vite-ignore */specifier)
       }
     }, getOuterStack)
   }

@@ -412,6 +412,20 @@ describe('installFailLoud', () => {
     await vi.waitFor(() => { expect(proc.exits).toEqual([1]) })
     expect(released).toBe(true)
   })
+
+  it('logs a plugin rejection without exiting under plugin-tolerant mode', () => {
+    const proc = fakeProc()
+    installFailLoud(NAME, proc, undefined, true)
+    const error = new Error('broken plugin')
+    proc.handlers[0]!(error)
+    expect(proc.written[0]).toContain(`${NAME}: plugin load failure ignored: `)
+    expect(proc.written[0]).toContain(error.stack)
+    expect(proc.exits).toEqual([])
+    // Tolerant mode keeps reporting later rejections instead of latching.
+    proc.handlers[0]!(new Error('another plugin'))
+    expect(proc.written).toHaveLength(2)
+    expect(proc.exits).toEqual([])
+  })
 })
 
 describe('assertEntriesLoaded', () => {
@@ -778,6 +792,71 @@ describe('boot', () => {
       `${NAME}: 1 entry did not activate`,
       './waiting.mjs: pending (waiting for service: neverProvided)',
     ].join('\n'))
+  })
+
+  it('boots despite an unimportable plugin when plugin failures are tolerated', async () => {
+    const dir = tmp()
+    writeFileSync(join(dir, 'good.mjs'), 'export function apply() {}\n')
+    writeFileSync(join(dir, 'cordis.yml'), [
+      '- id: ghost',
+      '  name: ./missing.mjs',
+      '- id: good',
+      '  name: ./good.mjs',
+      '',
+    ].join('\n'))
+    const ctx = await boot(NAME, join(dir, 'cordis.yml'), undefined, undefined, undefined, true)
+    try {
+      const entries = [...ctx.loader.entries()]
+      expect(entries.find(entry => entry.options.id === 'good')?.fiber).toBeDefined()
+      const ghost = entries.find(entry => entry.options.id === 'ghost')
+      expect(ghost?.fiber).toBeUndefined()
+      expect(ghost?.error).toBeInstanceOf(Error)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('boots despite a plugin whose apply throws when plugin failures are tolerated', async () => {
+    const dir = tmp()
+    writeFileSync(join(dir, 'broken.mjs'), [
+      'export const name = "broken"',
+      "export function apply() { throw new Error('broken startup') }",
+      '',
+    ].join('\n'))
+    writeFileSync(join(dir, 'good.mjs'), 'export function apply(ctx) { ctx.provide("goodMounted", true) }\n')
+    writeFileSync(join(dir, 'cordis.yml'), [
+      '- id: broken',
+      '  name: ./broken.mjs',
+      '- id: good',
+      '  name: ./good.mjs',
+      '',
+    ].join('\n'))
+    const ctx = await boot(NAME, join(dir, 'cordis.yml'), undefined, undefined, undefined, true)
+    try {
+      expect(ctx.get('goodMounted')).toBe(true)
+      const broken = [...ctx.loader.entries()].find(entry => entry.options.id === 'broken')
+      expect(broken?.fiber).toBeUndefined()
+      expect(broken?.error).toBeInstanceOf(Error)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('imports an entry whose name is a bare absolute path', async () => {
+    const dir = tmp()
+    const pluginPath = join(dir, 'absolute-name.mjs')
+    writeFileSync(pluginPath, 'export function apply() {}\n')
+    writeFileSync(join(dir, 'cordis.yml'), [
+      '- id: absolute-name',
+      `  name: ${JSON.stringify(pluginPath)}`,
+      '',
+    ].join('\n'))
+    const ctx = await boot(NAME, join(dir, 'cordis.yml'))
+    try {
+      expect([...ctx.loader.entries()].find(entry => entry.options.id === 'absolute-name')?.fiber).toBeDefined()
+    } finally {
+      await ctx.fiber.dispose()
+    }
   })
 })
 

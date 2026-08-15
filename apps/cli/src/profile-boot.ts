@@ -220,9 +220,12 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
   // complete; SIGINT is a user interrupt and reports 130.
   process.on('SIGTERM', () => { interrupt(0) })
   process.on('SIGINT', () => { interrupt(130) })
+  // Plugin-tolerant: any plugin load failure must never block dsh startup —
+  // it is logged and the harness keeps running so the user can fix or remove
+  // the broken plugin (boot also tolerates plugin failures below).
   installFailLoud(NAME, process, async () => {
     await app.current?.fiber.dispose()
-  })
+  }, true)
 
   const rootConfig = join(composed.profile.dir, PROFILE_ROOT_FILENAME)
   // Recomposition for the live user layers: bundle layers below, overlays
@@ -256,7 +259,7 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
       args: options.args,
       exit: code => void shutdown.shutdown(code),
     })
-  })
+  }, undefined, true)
   app.current = ctx
   // A surface can dispose the whole tree while boot or this post-boot watcher
   // setup is still in flight — a signal, or a fast one-shot's appExit. Loader

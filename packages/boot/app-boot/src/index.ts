@@ -472,6 +472,14 @@ function groupedDump(
   return lines.join('\n') + '\n'
 }
 
+/** Include tree that keeps a failing row inert instead of failing the whole tree. */
+class TolerantInclude extends Include {
+  constructor(ctx: Context, config: Include.Config) {
+    super(ctx, config)
+    this.tolerateFailures = true
+  }
+}
+
 /**
  * Mount and remember the exact root Include entry used by app boot and user patch-layer HMR.
  * @param ctx - context carrying an initialized Loader service.
@@ -479,6 +487,10 @@ function groupedDump(
  * @param patches - initial app and user patches, applied in order.
  * @param bareModuleBaseUrl - optional installed-host base for bare package
  * names; relative names continue to resolve beside the configuration file.
+ * @param tolerateFailures - when true, the mounted include tree keeps a
+ * failing row inert (logged, `entry.error` recorded) instead of failing the
+ * whole boot: the harness still starts so the user can fix or remove the
+ * broken plugin.
  * @returns the created root Include entry, or `undefined` when a surface
  * disposed the whole tree (taking the Loader service with it) while the
  * transactional create was still settling entry lifecycle.
@@ -488,10 +500,12 @@ export async function mountRootInclude(
   absoluteConfigPath: string,
   patches: readonly PatchOptions[] = [],
   bareModuleBaseUrl?: string,
+  tolerateFailures = false,
 ): Promise<Entry | undefined> {
+  const RootInclude = tolerateFailures ? TolerantInclude : Include
   ctx.loader.builtins.include = bareModuleBaseUrl === undefined
-    ? Include
-    : class HostResolvedRootInclude extends Include {
+    ? RootInclude
+    : class HostResolvedRootInclude extends RootInclude {
       override import(name: string, getOuterStack?: () => string[]): unknown {
         const specifier = isAbsolute(name) ? pathToFileURL(name).href : name
         if (name.startsWith('.') || name.startsWith('cordis:')) return super.import(specifier, getOuterStack)
@@ -604,16 +618,26 @@ export const FAIL_LOUD_RELEASE_TIMEOUT_MS = 2_000
  * @param release - optional teardown awaited before exit, used by a
  *   terminal-owning surface to restore the terminal. Its own failure is
  *   swallowed because the pending fatal exit already owns the outcome.
+ * @param toleratePluginFailures - when true, a late rejection is logged and
+ *   the process keeps running: a broken plugin must never take down the
+ *   harness, so plugin failures degrade to diagnostics instead of exit(1).
  * @returns the uninstaller that removes the rejection handler.
  */
 export function installFailLoud(
   binName: string,
   proc: FailLoudProcess = process,
   release?: () => Promise<void> | void,
+  toleratePluginFailures = false,
 ): () => void {
   let exiting = false
   const handler = (err: unknown): void => {
     if (assembledActivationRejections.has(err)) return
+    // Plugin-tolerant mode: a late plugin rejection is logged and the process
+    // keeps running — a broken plugin must never take down the harness.
+    if (toleratePluginFailures) {
+      proc.stderr.write(binName + ': plugin load failure ignored: ' + (err instanceof Error ? err.stack ?? err.message : String(err)) + '\n')
+      return
+    }
     // A release in flight already owns the exit. Swallow later rejections
     // (teardown's own included) rather than reporting a second failure over the
     // real one or letting Node kill the process before the terminal is back.
@@ -748,6 +772,11 @@ export async function assertEntriesActivated(ctx: Context, binName: string): Pro
  * @param bareModuleBaseUrl - optional installed-host base for bare package
  * names; use it when the host, rather than the configuration project, owns the
  * complete plugin set.
+ * @param toleratePluginFailures - when true, a failing plugin entry is logged
+ * and kept inert instead of failing the boot: the harness still starts so the
+ * user can fix or remove the broken plugin. The include tree keeps failing
+ * rows inert, the activation audit degrades to a warning, and late plugin
+ * rejections no longer exit the process.
  * @returns the root context once every entry has started, or as soon as a
  * surface disposed the tree while startup was still in flight.
  * @throws a labelled error after disposing the partial context — `host
@@ -760,6 +789,7 @@ export async function boot(
   patches?: PatchOptions[],
   prepare?: (ctx: Context) => Promise<void> | void,
   bareModuleBaseUrl?: string,
+  toleratePluginFailures = false,
 ): Promise<Context> {
   const ctx = new Context()
   // Two failure labels: `prepare` runs before any config-tree entry mounts,
@@ -771,7 +801,7 @@ export async function boot(
     await ctx.plugin(Loader)
     await prepare?.(ctx)
     stage = 'plugin tree failed to load'
-    await mountRootInclude(ctx, absoluteConfigPath, patches, bareModuleBaseUrl)
+    await mountRootInclude(ctx, absoluteConfigPath, patches, bareModuleBaseUrl, toleratePluginFailures)
     // A surface can finish and dispose the whole tree while startup is still
     // in flight, before the last entry settles. The Loader service goes with
     // it, and the activation audit describes a live tree — reading `ctx.loader`
@@ -779,9 +809,28 @@ export async function boot(
     // as asked. Transactional group updates settle
     // lifecycle inside the mount, so the teardown can land before it returns;
     // re-check after every await.
-    await ctx.get('loader')?.await()
+    try {
+      await ctx.get('loader')?.await()
+    } catch (error) {
+      if (!toleratePluginFailures) throw error
+      // Plugin-tolerant mode: a failing plugin tree must not block startup.
+      // The include tree already keeps failing rows inert, so this catch only
+      // covers nested trees outside the tolerance flag.
+      ctx.root.logger('loader').warn(
+        'plugin tree load failure ignored: ' + (error instanceof Error ? error.message : String(error)),
+      )
+    }
     if (ctx.get('loader') === undefined) return ctx
-    await assertEntriesActivated(ctx, binName)
+    try {
+      await assertEntriesActivated(ctx, binName)
+    } catch (error) {
+      if (!toleratePluginFailures) throw error
+      // assertEntriesActivated already awaited the process rejection checkpoint
+      // for failed fibers, so those reasons stay invisible to installFailLoud.
+      ctx.root.logger('loader').warn(
+        'plugin activation failure ignored: ' + (error instanceof Error ? error.message : String(error)),
+      )
+    }
     return ctx
   } catch (cause) {
     // Root-fiber disposal contains cleanup failures per observer (Cordis
